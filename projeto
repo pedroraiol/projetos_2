@@ -1,0 +1,247 @@
+import cv2
+import dlib
+import numpy as np
+from scipy.spatial import distance as dist
+from imutils import face_utils
+import pygame
+from collections import deque
+import time
+
+# Inicialização do pygame para alertas sonoros
+pygame.mixer.init()
+alerta_sonoro = pygame.mixer.Sound('alarme.mp3')
+
+# Constantes
+FECHAMENTO_OLHAR_CONSEC_FRAMES = 20
+BOCEJO_THRESH = 0.5
+BOCEJO_CONSEC_FRAMES = 15
+ADAPT_FACTOR = 0.75
+
+# Cores 
+COR_TEXTO = (255, 255, 255)
+COR_ALERTA = (0, 0, 255)  # Vermelho
+COR_NORMAL = (0, 255, 0)  # Verde
+COR_ATENCAO = (0, 255, 255)  # Amarelo
+COR_CALIBRACAO = (255, 255, 0)
+COR_FUNDO_INFO = (50, 50, 50)
+
+# Inicialização dos detectores
+detector_faces = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+# Índices dos pontos faciais
+(l_inicio, l_fim) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+(r_inicio, r_fim) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+(boca_inicio, boca_fim) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+
+def calcular_ear(olho):
+    A = dist.euclidean(olho[1], olho[5])
+    B = dist.euclidean(olho[2], olho[4])
+    C = dist.euclidean(olho[0], olho[3])
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+def calcular_mar(boca):
+    A = dist.euclidean(boca[2], boca[10])
+    B = dist.euclidean(boca[4], boca[8])
+    C = dist.euclidean(boca[0], boca[6])
+    mar = (A + B) / (2.0 * C)
+    return mar
+
+def determinar_cor_ear(ear, threshold):
+    """Determina a cor do EAR baseado no estado dos olhos"""
+    if ear < threshold * 0.8:  # Olhos muito fechados
+        return COR_ALERTA  # Vermelho
+    elif ear < threshold * 0.9:  # Olhos parcialmente fechados
+        return COR_ATENCAO  # Amarelo
+    else:  # Olhos abertos
+        return COR_NORMAL  # Verde
+
+def determinar_cor_mar(mar, threshold):
+    """Determina a cor do MAR baseado no estado da boca"""
+    if mar > threshold * 1.2:  # Bocejo muito aberto
+        return COR_ALERTA  # Vermelho
+    elif mar > threshold * 1.1:  # Bocejo parcial
+        return COR_ATENCAO  # Amarelo
+    else:  # Boca normal
+        return COR_NORMAL  # Verde
+
+def criar_painel_info(frame, texto, posicao, cor_fundo=COR_FUNDO_INFO, cor_texto=COR_TEXTO):
+    """Cria um painel de informação com fundo semi-transparente"""
+    (x, y) = posicao
+    (w, h) = (400, 30)
+    
+    # Criar retângulo de fundo
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), cor_fundo, -1)
+    
+    # Adicionar transparência
+    alpha = 0.6
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    
+    # Adicionar texto
+    cv2.putText(frame, texto, (x + 10, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_texto, 2)
+
+def criar_barra_status(frame, valor, posicao, tamanho, cor_normal=COR_NORMAL, cor_alerta=COR_ALERTA):
+    """Cria uma barra de status visual"""
+    (x, y) = posicao
+    (w, h) = tamanho
+    
+    # Determinar cor com base no valor
+    cor = cor_alerta if valor > BOCEJO_THRESH else cor_normal
+    
+    # Desenhar barra de fundo
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (100, 100, 100), -1)
+    
+    # Desenhar barra de progresso
+    progresso = int(min(valor / BOCEJO_THRESH, 1) * w)
+    cv2.rectangle(frame, (x, y), (x + progresso, y + h), cor, -1)
+    
+    # Adicionar texto
+    cv2.putText(frame, f"{valor:.2f}", (x + w + 10, y + h - 5), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COR_TEXTO, 1)
+
+# Variáveis globais
+contador_fechamento = 0
+contador_bocejo = 0
+alerta_sonolencia = False
+EAR_BASELINE = None
+ear_buffer = deque(maxlen=10)
+
+# Iniciar captura de vídeo
+cap = cv2.VideoCapture(0)
+
+# ----------------- CALIBRAÇÃO -----------------
+print("Iniciando calibração... mantenha os olhos ABERTOS por 5 segundos.")
+calibration_start = time.time()
+calibration_values = []
+
+while time.time() - calibration_start < 5:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.resize(frame, (640, 480))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    rects = detector_faces(gray, 0)
+    for rect in rects:
+        shape = predictor(gray, rect)
+        shape = face_utils.shape_to_np(shape)
+
+        olho_esquerdo = shape[l_inicio:l_fim]
+        olho_direito = shape[r_inicio:r_fim]
+        ear_medio = max(calcular_ear(olho_esquerdo), calcular_ear(olho_direito))
+        calibration_values.append(ear_medio)
+
+        # Interface de calibração
+        criar_painel_info(frame, "CALIBRANDO... Mantenha os olhos abertos e olhe para a camera", 
+                         (50, 30), (50, 50, 100), COR_CALIBRACAO)
+        
+        # Contador regressivo
+        tempo_restante = 5 - int(time.time() - calibration_start)
+        cv2.putText(frame, f"Tempo restante: {tempo_restante}s", (50, 80), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COR_CALIBRACAO, 2)
+
+    cv2.imshow("Detector de Sonolencia - Calibracao", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Definir EAR_BASELINE
+if len(calibration_values) > 0:
+    EAR_BASELINE = np.mean(calibration_values)
+    print(f"Calibracao concluida! EAR baseline = {EAR_BASELINE:.2f}")
+else:
+    EAR_BASELINE = 0.3
+    print("Calibracao falhou. Usando valor padrao EAR_BASELINE = 0.3")
+
+FECHAMENTO_OLHAR_THRESH = EAR_BASELINE * ADAPT_FACTOR
+cv2.destroyAllWindows()
+# ----------------- FIM DA CALIBRAÇÃO -----------------
+
+# ----------------- MONITORAMENTO -----------------
+print("Monitoramento iniciado!")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+        
+    frame = cv2.resize(frame, (640, 480))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    rects = detector_faces(gray, 0)
+    for rect in rects:
+        shape = predictor(gray, rect)
+        shape = face_utils.shape_to_np(shape)
+        
+        # Processamento dos olhos
+        olho_esquerdo = shape[l_inicio:l_fim]
+        olho_direito = shape[r_inicio:r_fim]
+        ear_medio = max(calcular_ear(olho_esquerdo), calcular_ear(olho_direito))
+        ear_buffer.append(ear_medio)
+        ear_medio = np.mean(ear_buffer)
+        
+        # Processamento da boca
+        boca = shape[boca_inicio:boca_fim]
+        mar = calcular_mar(boca)
+        
+        # Determinar cores baseadas no estado
+        cor_ear = determinar_cor_ear(ear_medio, FECHAMENTO_OLHAR_THRESH)
+        cor_mar = determinar_cor_mar(mar, BOCEJO_THRESH)
+        
+        # Desenhar contornos com cores diferentes baseadas no estado
+        cv2.drawContours(frame, [cv2.convexHull(olho_esquerdo)], -1, cor_ear, 2)
+        cv2.drawContours(frame, [cv2.convexHull(olho_direito)], -1, cor_ear, 2)
+        cv2.drawContours(frame, [cv2.convexHull(boca)], -1, cor_mar, 2)
+        
+        # Verificar sonolência
+        if ear_medio < FECHAMENTO_OLHAR_THRESH:
+            contador_fechamento += 1
+            if contador_fechamento >= FECHAMENTO_OLHAR_CONSEC_FRAMES:
+                criar_painel_info(frame, "ALERTA: SONOLENCIA DETECTADA!", 
+                                (10, 30), (50, 0, 0), (255, 255, 255))
+                alerta_sonolencia = True
+                alerta_sonoro.play()
+        else:
+            contador_fechamento = 0
+            alerta_sonolencia = False
+            
+        # Verificar bocejo
+        if mar > BOCEJO_THRESH:
+            contador_bocejo += 1
+            if contador_bocejo >= BOCEJO_CONSEC_FRAMES:
+                criar_painel_info(frame, "ALERTA: BOCEJO PROLONGADO!", 
+                                (10, 70), (50, 0, 0), (255, 255, 255))
+                alerta_sonolencia = True
+                alerta_sonoro.play()
+        else:
+            contador_bocejo = 0
+            
+        # Painel de informações com cores dinâmicas
+        criar_painel_info(frame, f"EAR: {ear_medio:.2f} (Limiar: {FECHAMENTO_OLHAR_THRESH:.2f})", 
+                         (10, 110), cor_texto=cor_ear)
+        criar_painel_info(frame, f"MAR: {mar:.2f} (Limiar: {BOCEJO_THRESH:.2f})", 
+                         (10, 150), cor_texto=cor_mar)
+        
+        # Barras de status visuais
+        criar_barra_status(frame, mar, (10, 190), (200, 20), cor_normal=COR_NORMAL, cor_alerta=cor_mar)
+        cv2.putText(frame, "Nivel de Bocejo:", (10, 185), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COR_TEXTO, 1)
+        
+        # Indicador de status
+        status_color = COR_ALERTA if alerta_sonolencia else COR_NORMAL
+        cv2.circle(frame, (600, 30), 10, status_color, -1)
+        cv2.putText(frame, "Status:", (550, 35), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COR_TEXTO, 1)
+    
+    cv2.imshow("Detector de Sonolencia - Monitoramento Ativo", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
